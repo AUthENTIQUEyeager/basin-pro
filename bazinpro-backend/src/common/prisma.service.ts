@@ -1,11 +1,29 @@
-import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 
 @Injectable()
 export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
-  async onModuleInit() {
-    await this.$connect();
+  private readonly logger = new Logger(PrismaService.name);
+
+  constructor() {
+    super({
+      datasources: {
+        db: { url: process.env.DATABASE_URL },
+      },
+      log: ['error'],
+    });
   }
+
+  async onModuleInit() {
+    try {
+      await this.$connect();
+      this.logger.log('Base de données connectée');
+    } catch (error) {
+      this.logger.warn('Connexion BDD différée — ' + error.message);
+      // Ne pas crasher au démarrage
+    }
+  }
+
   async onModuleDestroy() {
     await this.$disconnect();
   }
