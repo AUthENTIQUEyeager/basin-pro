@@ -1,4 +1,5 @@
-import { useAuthStore, useNavStore } from './stores/appStore';
+import { useEffect } from 'react';
+import { useAuthStore, useNavStore, useAppStore } from './stores/appStore';
 import { LoginPage } from './pages/LoginPage';
 import { Sidebar } from './components/layout/Sidebar';
 import { Topbar } from './components/layout/Topbar';
@@ -32,6 +33,14 @@ function AppContent() {
 
 export default function App() {
   const { isAuthenticated } = useAuthStore();
+  const { fetchAll } = useAppStore();
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      fetchAll();
+    }
+  }, [isAuthenticated]);
+
   if (!isAuthenticated) return <LoginPage />;
 
   return (

@@ -1,10 +1,12 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type { User, Page, SyncState, Vente, Tissu, Client, Depense, Qualite, Couleur, Boutique } from '../types';
+import { api } from '../lib/api';
 
 // ─── Auth Store ───────────────────────────────────────────────────────────────
 interface AuthStore {
   user: User | null;
+  token: string | null;
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<boolean>;
   logout: () => void;
@@ -14,27 +16,23 @@ export const useAuthStore = create<AuthStore>()(
   persist(
     (set) => ({
       user: null,
+      token: null,
       isAuthenticated: false,
-      login: async (email: string, _password: string) => {
-        await new Promise(r => setTimeout(r, 800));
-        const user: User = {
-          id: 'usr-' + Date.now(),
-          nom: '',
-          prenom: email.split('@')[0],
-          email,
-          role: 'manager',
-          actif: true,
-          boutique_id: 'btq-' + Date.now(),
-          created_at: new Date().toISOString(),
-        };
-        // Vider les données de l'ancien compte
-        localStorage.removeItem('bazinpro-data');
-        set({ user, isAuthenticated: true });
-        return true;
+
+      login: async (email: string, password: string) => {
+        try {
+          const res: any = await api.post('/auth/login', { email, password });
+          localStorage.removeItem('bazinpro-data');
+          set({ user: res.user, token: res.access_token, isAuthenticated: true });
+          return true;
+        } catch {
+          return false;
+        }
       },
+
       logout: () => {
         localStorage.removeItem('bazinpro-data');
-        set({ user: null, isAuthenticated: false });
+        set({ user: null, token: null, isAuthenticated: false });
       },
     }),
     { name: 'bazinpro-auth' }
@@ -62,27 +60,31 @@ interface AppStore {
   clients: Client[];
   depenses: Depense[];
   syncState: SyncState;
+  loading: boolean;
 
-  addTissu: (tissu: Tissu) => void;
-  updateTissu: (id: string, updates: Partial<Tissu>) => void;
-  addVente: (vente: Vente) => void;
-  annulerVente: (id: string, motif: string) => void;
-  addClient: (client: Client) => void;
-  addDepense: (depense: Depense) => void;
-  setSyncState: (state: Partial<SyncState>) => void;
+  // Fetch depuis l'API
+  fetchAll: () => Promise<void>;
+  fetchTissus: () => Promise<void>;
+  fetchVentes: () => Promise<void>;
+  fetchClients: () => Promise<void>;
+  fetchDepenses: () => Promise<void>;
+  fetchParametres: () => Promise<void>;
+
+  // Actions
+  addTissu: (dto: any) => Promise<void>;
+  updateTissu: (id: string, updates: Partial<Tissu>) => Promise<void>;
+  addVente: (dto: any) => Promise<void>;
+  annulerVente: (id: string, motif: string) => Promise<void>;
+  addDepense: (dto: any) => Promise<void>;
+  addQualite: (nom: string) => Promise<void>;
+  addCouleur: (nom: string, hex: string) => Promise<void>;
   triggerSync: () => Promise<void>;
-  addQualite: (nom: string) => void;
-  addCouleur: (nom: string, hex: string) => void;
-  updateBoutique: (updates: Partial<Boutique>) => void;
+  setSyncState: (state: Partial<SyncState>) => void;
 }
 
 const DEFAULT_BOUTIQUE: Boutique = {
-  id: 'btq-001',
-  nom: 'Ma Boutique',
-  adresse: '',
-  telephone: '',
-  abonnement_statut: 'actif',
-  abonnement_fin: '2026-12-31',
+  id: '', nom: 'Ma Boutique', adresse: '', telephone: '',
+  abonnement_statut: 'actif', abonnement_fin: '2026-12-31',
 };
 
 export const useAppStore = create<AppStore>()(
@@ -95,81 +97,157 @@ export const useAppStore = create<AppStore>()(
       ventes: [],
       clients: [],
       depenses: [],
+      loading: false,
       syncState: {
         statut: 'synced',
         derniere_sync: new Date().toISOString(),
         pending_count: 0,
       },
 
-      addTissu: (tissu) => set((s) => ({ tissus: [tissu, ...s.tissus] })),
-
-      updateTissu: (id, updates) =>
-        set((s) => ({
-          tissus: s.tissus.map((t) => t.id === id ? { ...t, ...updates, updated_at: new Date().toISOString() } : t),
-        })),
-
-      addVente: (vente) => {
-        const s = get();
-        const newTissus = s.tissus.map((t) => {
-          const ligne = vente.lignes.find((l) => l.tissu_id === t.id);
-          if (!ligne) return t;
-          const nouveau = t.metrage_disponible - ligne.metrage;
-          const statut = nouveau <= 0 ? 'epuise' : nouveau <= t.metrage_alerte ? 'bas' : 'disponible';
-          return { ...t, metrage_disponible: Math.max(0, nouveau), statut, updated_at: new Date().toISOString() };
-        });
-
-        let newClients = s.clients;
-        if (vente.client_nom && vente.client_prenom) {
-          const existing = s.clients.find(c => c.nom === vente.client_nom && c.prenom === vente.client_prenom);
-          if (existing) {
-            newClients = s.clients.map(c => c.id === existing.id
-              ? { ...c, total_achats: c.total_achats + vente.montant_total, nb_achats: c.nb_achats + 1, derniere_visite: vente.created_at }
-              : c
-            );
-          } else if (vente.client_id) {
-            const newClient: Client = {
-              id: vente.client_id, nom: vente.client_nom!, prenom: vente.client_prenom!,
-              telephone: vente.client_telephone, boutique_id: vente.boutique_id,
-              total_achats: vente.montant_total, nb_achats: 1,
-              derniere_visite: vente.created_at, created_at: vente.created_at,
-            };
-            newClients = [newClient, ...s.clients];
-          }
-        }
-        set({ ventes: [vente, ...s.ventes], tissus: newTissus, clients: newClients });
+      fetchAll: async () => {
+        set({ loading: true });
+        await Promise.all([
+          get().fetchTissus(),
+          get().fetchVentes(),
+          get().fetchClients(),
+          get().fetchDepenses(),
+          get().fetchParametres(),
+        ]);
+        set({ loading: false });
       },
 
-      annulerVente: (id, motif) =>
-        set((s) => ({
-          ventes: s.ventes.map((v) => v.id === id ? { ...v, statut: 'annulee' as const, motif_annulation: motif } : v),
-        })),
+      fetchTissus: async () => {
+        try {
+          const tissus: any[] = await api.get('/tissus');
+          set({ tissus: tissus.map(t => ({
+            id: t.id, code: t.code,
+            qualite_id: t.qualiteId, qualite_nom: t.qualite?.nom || '',
+            couleur_id: t.couleurId, couleur_nom: t.couleur?.nom || '', couleur_hex: t.couleur?.hex || '#000',
+            metrage_disponible: Number(t.metrageDisponible),
+            metrage_alerte: Number(t.metrageAlerte),
+            prix_achat: t.prixAchat ? Number(t.prixAchat) : undefined,
+            prix_vente: Number(t.prixVente),
+            emplacement: t.emplacement, observation: t.observation,
+            qr_code: t.qrCode, boutique_id: t.boutiqueId,
+            created_at: t.createdAt, updated_at: t.updatedAt,
+            statut: t.statut?.toLowerCase() || 'disponible',
+          })) });
+        } catch (e) { console.error('fetchTissus', e); }
+      },
 
-      addClient: (client) => set((s) => ({ clients: [client, ...s.clients] })),
+      fetchVentes: async () => {
+        try {
+          const ventes: any[] = await api.get('/ventes');
+          set({ ventes: ventes.map(v => ({
+            id: v.id, numero: v.numero, boutique_id: v.boutiqueId,
+            caissier_id: v.caissierIdRef, caissier_nom: `${v.caissier?.prenom || ''} ${v.caissier?.nom || ''}`.trim(),
+            client_id: v.clientId, client_nom: v.clientNom, client_prenom: v.clientPrenom,
+            client_telephone: v.clientTelephone,
+            lignes: (v.lignes || []).map((l: any) => ({
+              tissu_id: l.tissuId, tissu_code: l.tissuCode,
+              qualite_nom: l.qualiteNom, couleur_nom: l.couleurNom,
+              metrage: Number(l.metrage), prix_unitaire: Number(l.prixUnitaire), montant: Number(l.montant),
+            })),
+            montant_total: Number(v.montantTotal),
+            mode_paiement: v.modePaiement?.toLowerCase() || 'especes',
+            statut: v.statut?.toLowerCase() || 'validee',
+            motif_annulation: v.motifAnnulation,
+            created_at: v.createdAt, synced: true,
+          })) });
+        } catch (e) { console.error('fetchVentes', e); }
+      },
 
-      addDepense: (depense) => set((s) => ({ depenses: [depense, ...s.depenses] })),
+      fetchClients: async () => {
+        try {
+          const clients: any[] = await api.get('/clients');
+          set({ clients: clients.map(c => ({
+            id: c.id, nom: c.nom, prenom: c.prenom, telephone: c.telephone,
+            boutique_id: c.boutiqueId, total_achats: Number(c.totalAchats),
+            nb_achats: c.nbAchats, derniere_visite: c.derniereVisite, created_at: c.createdAt,
+          })) });
+        } catch (e) { console.error('fetchClients', e); }
+      },
+
+      fetchDepenses: async () => {
+        try {
+          const depenses: any[] = await api.get('/depenses');
+          set({ depenses: depenses.map(d => ({
+            id: d.id, boutique_id: d.boutiqueId, categorie: d.categorie,
+            montant: Number(d.montant), date: d.date?.slice(0, 10),
+            observation: d.observation, user_id: d.userId,
+            created_at: d.createdAt, synced: true,
+          })) });
+        } catch (e) { console.error('fetchDepenses', e); }
+      },
+
+      fetchParametres: async () => {
+        try {
+          const [qualites, couleurs, boutique]: any[] = await Promise.all([
+            api.get('/boutiques/qualites'),
+            api.get('/boutiques/couleurs'),
+            api.get('/boutiques/me'),
+          ]);
+          set({
+            qualites: qualites.map((q: any) => ({ id: q.id, nom: q.nom, boutique_id: q.boutiqueId, created_at: q.createdAt })),
+            couleurs: couleurs.map((c: any) => ({ id: c.id, nom: c.nom, hex: c.hex, boutique_id: c.boutiqueId, created_at: c.createdAt })),
+            boutique: {
+              id: boutique.id, nom: boutique.nom, adresse: boutique.adresse || '',
+              telephone: boutique.telephone || '',
+              abonnement_statut: boutique.abonnementStatut?.toLowerCase() || 'actif',
+              abonnement_fin: boutique.abonnementFin,
+            },
+          });
+        } catch (e) { console.error('fetchParametres', e); }
+      },
+
+      addTissu: async (dto) => {
+        await api.post('/tissus', dto);
+        await get().fetchTissus();
+      },
+
+      updateTissu: async (id, updates) => {
+        if (updates.metrage_disponible !== undefined) {
+          await api.patch(`/tissus/${id}/metrage`, { metrage: updates.metrage_disponible });
+        }
+        await get().fetchTissus();
+      },
+
+      addVente: async (dto) => {
+        await api.post('/ventes', dto);
+        await Promise.all([get().fetchVentes(), get().fetchTissus(), get().fetchClients()]);
+      },
+
+      annulerVente: async (id, motif) => {
+        await api.patch(`/ventes/${id}/annuler`, { motif });
+        await get().fetchVentes();
+      },
+
+      addDepense: async (dto) => {
+        await api.post('/depenses', dto);
+        await get().fetchDepenses();
+      },
+
+      addQualite: async (nom) => {
+        await api.post('/boutiques/qualites', { nom });
+        await get().fetchParametres();
+      },
+
+      addCouleur: async (nom, hex) => {
+        await api.post('/boutiques/couleurs', { nom, hex });
+        await get().fetchParametres();
+      },
 
       setSyncState: (state) => set((s) => ({ syncState: { ...s.syncState, ...state } })),
 
       triggerSync: async () => {
-        const { setSyncState } = get();
-        setSyncState({ statut: 'pending' });
-        await new Promise(r => setTimeout(r, 1500));
-        setSyncState({ statut: 'synced', derniere_sync: new Date().toISOString(), pending_count: 0 });
+        set((s) => ({ syncState: { ...s.syncState, statut: 'pending' } }));
+        await get().fetchAll();
+        set((s) => ({ syncState: { ...s.syncState, statut: 'synced', derniere_sync: new Date().toISOString(), pending_count: 0 } }));
       },
-
-      addQualite: (nom) =>
-        set((s) => ({
-          qualites: [...s.qualites, { id: 'q-' + Date.now(), nom, boutique_id: 'btq-001', created_at: new Date().toISOString() }],
-        })),
-
-      addCouleur: (nom, hex) =>
-        set((s) => ({
-          couleurs: [...s.couleurs, { id: 'c-' + Date.now(), nom, hex, boutique_id: 'btq-001', created_at: new Date().toISOString() }],
-        })),
-
-      updateBoutique: (updates) =>
-        set((s) => ({ boutique: { ...s.boutique, ...updates } })),
     }),
-    { name: 'bazinpro-data' }
+    {
+      name: 'bazinpro-data',
+      partialize: (s) => ({ boutique: s.boutique, qualites: s.qualites, couleurs: s.couleurs }),
+    }
   )
 );
